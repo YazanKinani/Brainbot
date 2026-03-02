@@ -26,7 +26,7 @@
 input int    InpMaxTradesPerDay      = 100;
 input double InpMaxDailyLossUSD      = 8000.0;
 
-// Per-trade + profit constraints (USD)  (SCALP defaults, unchanged)
+// Per-trade + profit constraints (USD)
 input double InpMaxLossPerTradeUSD   = 600.0;
 input double InpMinProfitUSD         = 600.0;
 
@@ -86,7 +86,7 @@ input int    InpPreSessionMinutes    = 120; // pre-session liquidity
 input bool   InpDecideOnTimerOnly    = true;
 
 //-------------------------
-// STRUCTURE THRESHOLDS (USD -> price via ref lots)  (SCALP defaults, unchanged)
+// STRUCTURE THRESHOLDS (USD -> price via ref lots)
 //-------------------------
 input double InpRefLotsForUSDConv    = 1.0;
 input double InpTouchDistanceUSD     = 0.0;  // tolerance around ACC for "touch"
@@ -106,7 +106,7 @@ input int    InpDedupHours           = 12;     // don't re-trade same ACC right_
 input int    InpMaxSpreadPoints      = 2000;    // spread filter (points)
 
 
-// Trigger/analysis TFs (SCALP defaults, unchanged)
+// Trigger/analysis TFs
 input ENUM_TIMEFRAMES InpTriggerTF   = PERIOD_M1; // HA trigger TF
 input double          InpAccOvershootPct  = 0.10;        // 10% rule: allow up to 10% overshoot beyond ACC edges (and use as edge-zone width)
 
