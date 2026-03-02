@@ -12,7 +12,7 @@
 //| - Gates/TTL/dedup/telemetry unchanged & shared.                   |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "2.13"
+#property version   "2.15"
 #property description "BrainBot Step C: Node-RED parse + Class-A execution + USD sizing + split TTL + cooldown + dedup + intraday mode"
 
 #define MAX_SYMS 8
@@ -130,6 +130,8 @@ input bool InpEnableIntraday = true;   // set FALSE to run scalp only
 // Freshness
 input int    InpIntraBreakoutFreshSeconds       = 900;     // ignore very old breakout signals
 input int    InpIntraMitigationFreshSeconds     = 21600;   // mitigation can happen later (up to 6h)
+input int    InpIntraTimeSkewToleranceSec       = 120;     // allow small Node-RED/MT5 clock skew
+input int    InpIntraAccRTToleranceSec          = 2;       // tolerant acc_right_time compare
 
 // Risk / sizing for intraday
 input double InpIntraMaxLossPerTradeUSD         = 600.0;
@@ -1311,6 +1313,37 @@ long NormalizeTimeMaybeMs(long t)
    if(t <= 0) return 0;
    if(t > 20000000000) t = (long)(t / 1000); // ms -> sec
    return t;
+}
+
+bool TimeCloseEnough(const long a, const long b, const int tolSec)
+{
+   if(a<=0 || b<=0) return false;
+   return (MathAbs(a-b) <= tolSec);
+}
+
+bool IsFreshWithSkew(const long evtTimeSec, const int freshSec)
+{
+   if(evtTimeSec<=0 || freshSec<=0) return false;
+   long nowG = (long)TimeGMT();
+   long age  = nowG - evtTimeSec;
+   if(age < 0)
+   {
+      if(MathAbs(age) <= InpIntraTimeSkewToleranceSec) age = 0;
+      else return false;
+   }
+   return (age <= freshSec);
+}
+
+bool TFHasBreakoutForAccRT(const TFState &st, const long accRT)
+{
+   if(accRT<=0) return false;
+   if(st.brk.valid)
+   {
+      long rt = NormalizeTimeMaybeMs((long)st.brk.acc_right_time);
+      if(rt>0 && (rt==accRT || TimeCloseEnough(rt, accRT, InpIntraAccRTToleranceSec)))
+         return true;
+   }
+   return false;
 }
 
 // Extract the latest (max timeField) object from json[arrayKey]
@@ -2858,8 +2891,6 @@ bool BuildClassATrade_Intraday(SymbolCtx &ctx,
 
    if(!InpIntraEnable) { reasonOut="intra_disabled"; return false; }
 
-   long nowG = (long)TimeGMT();
-
    // best candidate = latest event_time
    IntraSignal best;
    best.valid=false;
@@ -2908,8 +2939,7 @@ bool BuildClassATrade_Intraday(SymbolCtx &ctx,
          long bt = NormalizeTimeMaybeMs(st.brk.break_time);
          long rt = NormalizeTimeMaybeMs(st.brk.acc_right_time);
 
-         int age = (int)(nowG - bt);
-         if(age >= 0 && age <= InpIntraBreakoutFreshSeconds)
+         if(IsFreshWithSkew(bt, InpIntraBreakoutFreshSeconds))
          {
             if(!best.valid || bt > best.event_time)
             {
@@ -2930,19 +2960,18 @@ bool BuildClassATrade_Intraday(SymbolCtx &ctx,
          long mt = NormalizeTimeMaybeMs(st.mit.mit_time);
          long rt = NormalizeTimeMaybeMs(st.mit.acc_right_time);
 
-         int age = (int)(nowG - mt);
-         if(age >= 0 && age <= InpIntraMitigationFreshSeconds)
+         if(IsFreshWithSkew(mt, InpIntraMitigationFreshSeconds))
          {
             bool okMatch=false;
 
-            if(tf=="M"  && ctx.intraLastBrkRT_M==rt)  okMatch=true;
-            if(tf=="W"  && ctx.intraLastBrkRT_W==rt)  okMatch=true;
-            if(tf=="D"  && ctx.intraLastBrkRT_D==rt)  okMatch=true;
-            if(tf=="H1" && ctx.intraLastBrkRT_H1==rt) okMatch=true;
-            if(tf=="M5" && ctx.intraLastBrkRT_M5==rt) okMatch=true;
+            if(tf=="M"  && (ctx.intraLastBrkRT_M==rt  || TimeCloseEnough(ctx.intraLastBrkRT_M,  rt, InpIntraAccRTToleranceSec))) okMatch=true;
+            if(tf=="W"  && (ctx.intraLastBrkRT_W==rt  || TimeCloseEnough(ctx.intraLastBrkRT_W,  rt, InpIntraAccRTToleranceSec))) okMatch=true;
+            if(tf=="D"  && (ctx.intraLastBrkRT_D==rt  || TimeCloseEnough(ctx.intraLastBrkRT_D,  rt, InpIntraAccRTToleranceSec))) okMatch=true;
+            if(tf=="H1" && (ctx.intraLastBrkRT_H1==rt || TimeCloseEnough(ctx.intraLastBrkRT_H1, rt, InpIntraAccRTToleranceSec))) okMatch=true;
+            if(tf=="M5" && (ctx.intraLastBrkRT_M5==rt || TimeCloseEnough(ctx.intraLastBrkRT_M5, rt, InpIntraAccRTToleranceSec))) okMatch=true;
 
-            // allow match if TF has breakout with same acc_right_time
-            if(st.brk.valid && NormalizeTimeMaybeMs(st.brk.acc_right_time)==rt) okMatch=true;
+            // Also check breakout object directly
+            if(!okMatch && TFHasBreakoutForAccRT(st, rt)) okMatch=true;
 
             if(okMatch)
             {
@@ -2981,7 +3010,7 @@ bool BuildClassATrade_Intraday(SymbolCtx &ctx,
       for(int i=0; i<st2.accCount; i++)
       {
          long rt = NormalizeTimeMaybeMs((long)st2.accList[i].right_time);
-         if(rt == best.acc_rt) { accRef = st2.accList[i]; break; }
+         if(rt == best.acc_rt || TimeCloseEnough(rt, best.acc_rt, InpIntraAccRTToleranceSec)) { accRef = st2.accList[i]; break; }
       }
       if(!accRef.valid && st2.acc.valid) accRef = st2.acc;
    }
@@ -3976,6 +4005,12 @@ void ProcessSymbol(SymbolCtx &ctx)
                   }
                }
             }
+         }
+         else
+         {
+            if(InpEnableTelemetry)
+               SendTelemetry("trade_skip", ctx.sym, "N/A", 0.0, 0.0, 0.0, 0.0, "n/a",
+                             "INTRA_BUILD_FAIL:"+buildReason, 0.0, eg);
          }
       }
    }
