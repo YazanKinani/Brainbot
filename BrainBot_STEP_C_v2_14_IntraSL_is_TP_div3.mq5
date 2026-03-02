@@ -12,7 +12,7 @@
 //| - Gates/TTL/dedup/telemetry unchanged & shared.                   |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "2.13"
+#property version   "2.15"
 #property description "BrainBot Step C: Node-RED parse + Class-A execution + USD sizing + split TTL + cooldown + dedup + intraday mode"
 
 #define MAX_SYMS 8
@@ -160,6 +160,8 @@ input double InpIntraLowVolRangeUSD             = 5.0;    // if avg M5 range <= 
 
 // Intraday: stronger cooldown (still used by GateFailReason)
 input int    InpIntraCooldownMinutes            = 2;
+input int    InpIntraTimeSkewToleranceSec       = 120;  // allow small Node-RED/MT5 clock skew
+input int    InpIntraAccRTToleranceSec          = 600;  // tolerant acc_right_time compare (10 min)
 input bool InpIntraForceFlatDaily     = false;  // enable/disable daily force-flat
 input int  InpIntraFlatHour           = 23;     // Amman hour (0-23)
 input int  InpIntraFlatMinute         = 50;     // Amman minute (0-59)
@@ -1764,8 +1766,8 @@ bool ParseMitigationObj(const string obj, MitigationEvt &m)
    m.mit_time       = NormalizeTimeMaybeMs(m.mit_time);
    m.acc_right_time = NormalizeTimeMaybeMs(m.acc_right_time);
 
-   // Keep it strict: require price (you need it for intraday logic)
-   if(m.mit_time>0 && m.acc_right_time>0 && m.mit_price>0 && m.dir!=0)
+   // mit_price is optional — if missing/null/0 the builder will use market price
+   if(m.mit_time>0 && m.acc_right_time>0 && m.dir!=0)
    {
       m.valid=true;
       return true;
@@ -2317,6 +2319,14 @@ bool FreshGatesOK(SymbolCtx &ctx)
    if(!ctx.gates.valid) return false;
 
    long ua = NormalizeEpochSec((long)ctx.gates_updated_at);
+
+   // FALLBACK: if gates_updated_at is 0 but areas_updated_at is valid, use areas timestamp
+   if(ua <= 0)
+   {
+      ua = NormalizeEpochSec((long)ctx.areas_updated_at);
+      if(ua > 0) ctx.gates_updated_at = ua;
+   }
+
    if(ua <= 0) return false;
    ctx.gates_updated_at = ua;
 
@@ -2826,6 +2836,37 @@ struct IntraSignal
 };
 
 
+bool TimeCloseEnough(const long a, const long b, const int tolSec)
+{
+   if(a<=0 || b<=0) return false;
+   return (MathAbs((int)(a-b)) <= tolSec);
+}
+
+bool IsFreshWithSkew(const long evtTimeSec, const int freshSec)
+{
+   if(evtTimeSec<=0 || freshSec<=0) return false;
+   long nowG = (long)TimeGMT();
+   long age  = nowG - evtTimeSec;
+   if(age < 0)
+   {
+      if(MathAbs((int)age) <= InpIntraTimeSkewToleranceSec) age = 0;
+      else return false;
+   }
+   return (age <= freshSec);
+}
+
+bool TFHasBreakoutForAccRT(const TFState &st, const long accRT)
+{
+   if(accRT<=0) return false;
+   if(st.brk.valid)
+   {
+      long rt = NormalizeTimeMaybeMs((long)st.brk.acc_right_time);
+      if(rt>0 && (rt==accRT || TimeCloseEnough(rt, accRT, InpIntraAccRTToleranceSec)))
+         return true;
+   }
+   return false;
+}
+
 // NOTE:
 // - MQL5 does NOT allow pointers to structs. So we use GetTFStateByTag(..., TFState &out).
 // - This version supports M/W/D/H1/M5 signals (and can be extended to M1 if you want).
@@ -2857,8 +2898,6 @@ bool BuildClassATrade_Intraday(SymbolCtx &ctx,
    sigOut.accLow=0;
 
    if(!InpIntraEnable) { reasonOut="intra_disabled"; return false; }
-
-   long nowG = (long)TimeGMT();
 
    // best candidate = latest event_time
    IntraSignal best;
@@ -2908,8 +2947,7 @@ bool BuildClassATrade_Intraday(SymbolCtx &ctx,
          long bt = NormalizeTimeMaybeMs(st.brk.break_time);
          long rt = NormalizeTimeMaybeMs(st.brk.acc_right_time);
 
-         int age = (int)(nowG - bt);
-         if(age >= 0 && age <= InpIntraBreakoutFreshSeconds)
+         if(IsFreshWithSkew(bt, InpIntraBreakoutFreshSeconds))
          {
             if(!best.valid || bt > best.event_time)
             {
@@ -2930,19 +2968,18 @@ bool BuildClassATrade_Intraday(SymbolCtx &ctx,
          long mt = NormalizeTimeMaybeMs(st.mit.mit_time);
          long rt = NormalizeTimeMaybeMs(st.mit.acc_right_time);
 
-         int age = (int)(nowG - mt);
-         if(age >= 0 && age <= InpIntraMitigationFreshSeconds)
+         if(IsFreshWithSkew(mt, InpIntraMitigationFreshSeconds))
          {
             bool okMatch=false;
 
-            if(tf=="M"  && ctx.intraLastBrkRT_M==rt)  okMatch=true;
-            if(tf=="W"  && ctx.intraLastBrkRT_W==rt)  okMatch=true;
-            if(tf=="D"  && ctx.intraLastBrkRT_D==rt)  okMatch=true;
-            if(tf=="H1" && ctx.intraLastBrkRT_H1==rt) okMatch=true;
-            if(tf=="M5" && ctx.intraLastBrkRT_M5==rt) okMatch=true;
+            if(tf=="M"  && (ctx.intraLastBrkRT_M==rt  || TimeCloseEnough(ctx.intraLastBrkRT_M,  rt, InpIntraAccRTToleranceSec))) okMatch=true;
+            if(tf=="W"  && (ctx.intraLastBrkRT_W==rt  || TimeCloseEnough(ctx.intraLastBrkRT_W,  rt, InpIntraAccRTToleranceSec))) okMatch=true;
+            if(tf=="D"  && (ctx.intraLastBrkRT_D==rt  || TimeCloseEnough(ctx.intraLastBrkRT_D,  rt, InpIntraAccRTToleranceSec))) okMatch=true;
+            if(tf=="H1" && (ctx.intraLastBrkRT_H1==rt || TimeCloseEnough(ctx.intraLastBrkRT_H1, rt, InpIntraAccRTToleranceSec))) okMatch=true;
+            if(tf=="M5" && (ctx.intraLastBrkRT_M5==rt || TimeCloseEnough(ctx.intraLastBrkRT_M5, rt, InpIntraAccRTToleranceSec))) okMatch=true;
 
-            // allow match if TF has breakout with same acc_right_time
-            if(st.brk.valid && NormalizeTimeMaybeMs(st.brk.acc_right_time)==rt) okMatch=true;
+            // Also check breakout object directly in same TF
+            if(!okMatch && TFHasBreakoutForAccRT(st, rt)) okMatch=true;
 
             if(okMatch)
             {
@@ -2981,7 +3018,8 @@ bool BuildClassATrade_Intraday(SymbolCtx &ctx,
       for(int i=0; i<st2.accCount; i++)
       {
          long rt = NormalizeTimeMaybeMs((long)st2.accList[i].right_time);
-         if(rt == best.acc_rt) { accRef = st2.accList[i]; break; }
+         if(rt == best.acc_rt || TimeCloseEnough(rt, best.acc_rt, InpIntraAccRTToleranceSec))
+            { accRef = st2.accList[i]; break; }
       }
       if(!accRef.valid && st2.acc.valid) accRef = st2.acc;
    }
@@ -3161,6 +3199,13 @@ bool GateFailReason(SymbolCtx &ctx, string &reason, const bool isIntraday)
 
       if(ctx.areas_updated_at <= 0 && !ctx.has_initial_sync) { reason="node_red_areas_not_ready"; return true; }
       if(!ctx.has_initial_sync && !FreshAreasOK(ctx)) { reason="stale_areas_data"; return true; }
+
+      // If areas are flowing but gates haven't been received yet, don't block
+      if(ctx.has_initial_sync && ctx.gates_updated_at <= 0 && ctx.areas_updated_at > 0)
+      {
+         // Use areas timestamp as gates fallback
+         ctx.gates_updated_at = ctx.areas_updated_at;
+      }
    }
 
    if(!g.valid) { reason="no_valid_gates"; return true; }
@@ -3880,6 +3925,12 @@ void ProcessSymbol(SymbolCtx &ctx)
          IntraSignal sig; sig.valid=false;
 
          bool built = BuildClassATrade_Intraday(ctx, isBuy, lots, entry, sl, tp, rr, buildReason, dedupKey, sig);
+
+         if(!built && InpEnableTelemetry)
+         {
+            SendTelemetry("trade_skip", ctx.sym, "N/A", 0.0, 0.0, 0.0, 0.0, "n/a",
+                          "INTRA_BUILD_FAIL:"+buildReason, 0.0, eg);
+         }
 
          if(built && sig.valid && lots>0 && entry>0 && sl>0 && tp>=0)
          {
